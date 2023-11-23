@@ -6,8 +6,13 @@
  * Adapted from https://github.com/obsproject/obs-studio/blob/master/plugins/win-capture/graphics-hook/d3d11-capture.cpp
  */
 
+#include <imgui.h>
 #include <reshade.hpp>
 #include "obs_hook_info.hpp"
+
+static bool s_enabled = true;
+static int s_timing = 0;
+bool is_hook_ready = false;
 
 struct capture_data
 {
@@ -53,11 +58,11 @@ static bool capture_impl_init(reshade::api::device *device, reshade::api::resour
 		data.using_shtex = true;
 
 		if (!device->create_resource(
-				reshade::api::resource_desc(data.cx, data.cy, 1, 1, data.format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest, reshade::api::resource_flags::shared),
-				nullptr,
-				reshade::api::resource_usage::copy_dest,
-				&data.shtex.texture,
-				&data.shtex.handle))
+			reshade::api::resource_desc(data.cx, data.cy, 1, 1, data.format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest, reshade::api::resource_flags::shared),
+			nullptr,
+			reshade::api::resource_usage::copy_dest,
+			&data.shtex.texture,
+			&data.shtex.handle))
 			return false;
 
 		if (!capture_init_shtex(data.shtex.shtex_info, window, data.cx, data.cy, static_cast<uint32_t>(data.format), false, (uintptr_t)data.shtex.handle))
@@ -70,10 +75,10 @@ static bool capture_impl_init(reshade::api::device *device, reshade::api::resour
 		for (int i = 0; i < NUM_BUFFERS; i++)
 		{
 			if (!device->create_resource(
-					reshade::api::resource_desc(data.cx, data.cy, 1, 1, data.format, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
-					nullptr,
-					reshade::api::resource_usage::cpu_access,
-					&data.shmem.copy_surfaces[i]))
+				reshade::api::resource_desc(data.cx, data.cy, 1, 1, data.format, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
+				nullptr,
+				reshade::api::resource_usage::cpu_access,
+				&data.shmem.copy_surfaces[i]))
 				return false;
 		}
 
@@ -195,34 +200,96 @@ static void capture_impl_shmem(reshade::api::command_queue *queue, reshade::api:
 	data.shmem.cur_tex = next_tex;
 }
 
+static bool check_hook(reshade::api::effect_runtime *runtime, int timing)
+{
+	if (!s_enabled)
+	{
+		if (is_hook_ready)
+		{
+			hook_free();
+			is_hook_ready = false;
+		}
+
+		return false;
+	}
+	else if (!is_hook_ready)
+	{
+		is_hook_ready = hook_init();
+	}
+
+	if (is_hook_ready && global_hook_info != nullptr) {
+		if (capture_should_stop())
+			capture_impl_free(runtime->get_device());
+
+		if (s_timing == timing && capture_should_init())
+			capture_impl_init(runtime->get_device(), runtime->get_current_back_buffer(), runtime->get_hwnd());
+	}
+
+	return s_timing == timing && is_hook_ready && global_hook_info != nullptr && capture_ready();
+}
+
 static void on_present(reshade::api::effect_runtime *runtime)
 {
-	if (global_hook_info == nullptr)
+	if (!check_hook(runtime, 0))
 		return;
 
-	const reshade::api::resource back_buffer = runtime->get_current_back_buffer();
+	reshade::api::resource back_buffer = runtime->get_current_back_buffer();
 
-	if (capture_should_stop())
-		capture_impl_free(runtime->get_device());
+	if (data.using_shtex)
+		capture_impl_shtex(runtime->get_command_queue(), back_buffer);
+	else
+		capture_impl_shmem(runtime->get_command_queue(), back_buffer);
+}
 
-	if (capture_should_init())
-		capture_impl_init(runtime->get_device(), back_buffer, runtime->get_hwnd());
+static void on_reshade_present(reshade::api::effect_runtime *runtime)
+{
+	if (!check_hook(runtime, 2))
+		return;
 
-	if (capture_ready())
-	{
-		if (data.using_shtex)
-			capture_impl_shtex(runtime->get_command_queue(), back_buffer);
-		else
-			capture_impl_shmem(runtime->get_command_queue(), back_buffer);
-	}
+	reshade::api::resource back_buffer = runtime->get_current_back_buffer();
+
+	if (data.using_shtex)
+		capture_impl_shtex(runtime->get_command_queue(), back_buffer);
+	else
+		capture_impl_shmem(runtime->get_command_queue(), back_buffer);
+}
+
+static void on_overlay(reshade::api::effect_runtime *swapchain)
+{
+	if (!check_hook(swapchain, 1))
+		return;
+
+	reshade::api::resource back_buffer = swapchain->get_current_back_buffer();
+
+	if (data.using_shtex)
+		capture_impl_shtex(swapchain->get_command_queue(), back_buffer);
+	else
+		capture_impl_shmem(swapchain->get_command_queue(), back_buffer);
 }
 
 static void on_destroy(reshade::api::effect_runtime *runtime)
 {
-	if (global_hook_info == nullptr)
+	if (global_hook_info != nullptr)
 		return;
 
 	capture_impl_free(runtime->get_device());
+}
+
+static void draw_settings(reshade::api::effect_runtime *)
+{
+	ImGui::Checkbox("Enabled", &s_enabled); ImGui::SameLine();
+	if (ImGui::IsItemHovered())
+	{
+		ImGui::BeginTooltip();
+		ImGui::TextUnformatted("NOT work well, DON'T click it");
+		ImGui::EndTooltip();
+	}
+
+	ImGui::RadioButton("BeforeEffect", &s_timing, 0); ImGui::SameLine();
+	ImGui::RadioButton("AfterEffect", &s_timing, 1); ImGui::SameLine();
+	ImGui::RadioButton("Overlay", &s_timing, 2);
+
+	reshade::set_config_value(nullptr, "OBS", "CaptureTiming", s_timing);
 }
 
 extern "C" __declspec(dllexport) const char *NAME = "OBS Capture";
@@ -241,6 +308,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
 
 	// Change this event to e.g. 'reshade_begin_effects' to send images to OBS before ReShade effects are applied, or 'reshade_render_technique' to send after a specific technique.
 	reshade::register_event<reshade::addon_event::reshade_present>(on_present);
+	reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
+	reshade::register_event<reshade::addon_event::reshade_overlay>(on_overlay);
 	reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy);
 
 	return true;
